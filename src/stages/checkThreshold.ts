@@ -1,9 +1,9 @@
-import { dirname } from 'path';
+import { dirname, sep } from 'path';
 
 import isNil from 'lodash/isNil';
 import micromatch from 'micromatch';
 
-import { JestThreshold } from '../typings/JestThreshold';
+import { JestThreshold, SingleThreshold } from '../typings/JestThreshold';
 import { JsonReport } from '../typings/JsonReport';
 import { FailReason } from '../typings/Report';
 import { ThresholdResult } from '../typings/ThresholdResult';
@@ -12,7 +12,67 @@ import { checkSingleThreshold } from '../utils/checkSingleThreshold';
 import { DataCollector } from '../utils/DataCollector';
 import { getCoverageForDirectory } from '../utils/getCoverageForDirectory';
 import { getFileCoverageMap } from '../utils/getFileCoverageMap';
+import { DetailedFileCoverage } from '../utils/getFileCoverageMap';
 import { joinPaths } from '../utils/joinPaths';
+
+export const getNormalizedThreshold = (
+    threshold: JestThreshold
+): JestThreshold => {
+    const trailingSlashReg = new RegExp(`${sep}$`);
+    const thresholdEntries = Object.entries(threshold).filter(
+        ([path]) => path !== 'global'
+    );
+
+    return Object.fromEntries(
+        thresholdEntries.map(([path, threshold]): [string, SingleThreshold] => [
+            path.replace(trailingSlashReg, ''),
+            threshold,
+        ])
+    );
+};
+
+export const getCoveredDirectories = (
+    coverageDetailMap: Record<string, DetailedFileCoverage>
+): string[] => {
+    const coveragePaths = Object.keys(coverageDetailMap);
+    const dirSet = new Set<string>();
+
+    coveragePaths.forEach((path) => {
+        let directory = dirname(path);
+
+        while (directory !== '.') {
+            dirSet.add(directory);
+            directory = dirname(directory);
+        }
+    });
+
+    return Array.from(dirSet);
+};
+
+export const getUncheckedFiles = (
+    threshold: JestThreshold,
+    coverageDetailMap: Record<string, DetailedFileCoverage>
+) => {
+    const normalizedThresholds = getNormalizedThreshold(threshold);
+    const normalizedThresholdPaths = Object.entries(normalizedThresholds).map(
+        ([path]) => path
+    );
+
+    const files = Object.keys(coverageDetailMap);
+
+    if (normalizedThresholdPaths.length) {
+        const directories = getCoveredDirectories(coverageDetailMap);
+
+        return micromatch.not(
+            files,
+            normalizedThresholdPaths
+                .concat(micromatch(directories, normalizedThresholdPaths))
+                .map((path) => `${path}/**`)
+        );
+    }
+
+    return files;
+};
 
 export const checkThreshold = (
     report: JsonReport,
@@ -24,29 +84,17 @@ export const checkThreshold = (
     // Maybe somehow take this from "format" stage?
     const coverageDetailMap = Object.fromEntries(
         Object.entries(getFileCoverageMap(report)).map(([key, value]) => [
-            key.substring(cwd.length + 1),
+            key.replace(`${cwd}/`, ''),
             value,
         ])
     );
 
-    const dirSet = new Set<string>();
-
-    Object.keys(coverageDetailMap)
-        .filter((value) => value === 'global')
-        .forEach((value) => {
-            let directory = dirname(value);
-
-            while (directory !== '.') {
-                dirSet.add(directory);
-                directory = dirname(directory);
-            }
-        });
-
-    const directories = Array.from(dirSet);
-
     const totalResults: ThresholdResult[] = [];
+    const normalizedThresholds = getNormalizedThreshold(threshold);
+    const normalizedThresholdEntries = Object.entries(normalizedThresholds);
 
-    Object.entries(threshold).forEach(([pattern, threshold]) => {
+    const directories = getCoveredDirectories(coverageDetailMap);
+    normalizedThresholdEntries.forEach(([pattern, threshold]) => {
         const selectedDirectories = micromatch(directories, pattern);
 
         const coverageOfDirectories = selectedDirectories.map((directory) =>
@@ -69,7 +117,7 @@ export const checkThreshold = (
     });
 
     const files = Object.keys(coverageDetailMap);
-    Object.entries(threshold).forEach(([pattern, threshold]) => {
+    normalizedThresholdEntries.forEach(([pattern, threshold]) => {
         const selectedFiles = micromatch(files, pattern);
 
         const thresholdResults = selectedFiles.map((filename) =>
@@ -88,13 +136,9 @@ export const checkThreshold = (
     });
 
     if (!isNil(threshold.global)) {
-        const uncheckedFiles = micromatch.not(
-            files,
-            Object.keys(threshold).concat(
-                micromatch(directories, Object.keys(threshold)).map(
-                    (value) => `${value}/**`
-                )
-            )
+        const uncheckedFiles = getUncheckedFiles(
+            normalizedThresholds,
+            coverageDetailMap
         );
 
         const uncheckedTotal = accumulateCoverageDetails(
